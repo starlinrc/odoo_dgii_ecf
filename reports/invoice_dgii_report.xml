@@ -92,18 +92,28 @@
 
         <!-- Agregar QR de firma digital después del total -->
         <xpath expr="//div[@id='total']" position="after">
-            <div class="row mt-4" t-if="o.encf" style="page-break-inside: avoid;">
+            <t t-set="qr_url_encoded" t-value="o.get_qr_dgii_url()"/>
+            <div class="row mt-4" t-if="qr_url_encoded" style="page-break-inside: avoid;">
                 <div class="col-12 text-center">
-                    <!-- QR Code de Verificación DGII -->
-                    <t t-set="qr_url" t-value="'https://ecf.dgii.gov.do/consultacf/consultar?rncemisor=%s&amp;rnccomprador=%s&amp;encf=%s&amp;monto=%.2f' % (o.company_id.vat or '', o.partner_id.vat or '', o.encf, o.amount_total)"/>
+                    <!-- QR Code de Verificación DGII: usa la URL real devuelta
+                         por DGII/MSeller al firmar (o.dgii_qr_url), no una
+                         URL fabricada localmente. -->
                     <div style="margin-bottom: 10px;">
-                        <img t-att-src="'/report/barcode/QR/%s' % qr_url"
+                        <img t-att-src="'/report/barcode/QR/%s?width=130&amp;height=130' % qr_url_encoded"
                              style="width: 120px; height: 120px; border: 1px solid #ccc;"
                              alt="QR Verificación DGII"/>
                     </div>
                     <div style="font-size: 9px; color: #666;">
                         Escanee para verificar en <strong>ecf.dgii.gov.do</strong>
                     </div>
+                    <div style="font-size: 9px; color: #333; margin-top: 4px;" t-if="o.dgii_security_code">
+                        <strong>Código de Seguridad:</strong> <span t-esc="o.dgii_security_code"/>
+                    </div>
+                </div>
+            </div>
+            <div class="row mt-2" t-elif="o.encf" style="page-break-inside: avoid;">
+                <div class="col-12 text-center" style="font-size: 9px; color: #b91c1c;">
+                    Este comprobante aún no ha sido firmado/aceptado por DGII (sin código QR ni de seguridad).
                 </div>
             </div>
 

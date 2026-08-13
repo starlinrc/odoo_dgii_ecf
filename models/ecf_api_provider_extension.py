@@ -13,7 +13,7 @@ class EcfApiProviderExtension(models.Model):
     """Extiende ecf.api.provider para soportar move_id."""
     _inherit = 'ecf.api.provider'
 
-    def send_ecf_from_invoice(self, ecf_json, move, origin='invoice'):
+    def send_ecf_from_invoice(self, ecf_json, move, origin='invoice', validate_only=False):
         """
         Envía un e-CF desde una factura y guarda la relación en el log.
 
@@ -21,6 +21,8 @@ class EcfApiProviderExtension(models.Model):
             ecf_json: dict con el JSON del ECF
             move: record de account.move
             origin: tipo de origen (invoice, credit_note, debit_note)
+            validate_only: si True, solo valida el formato sin consumir la
+                secuencia de e-NCF ni enviar a DGII (solo MSeller).
 
         Returns:
             tuple: (success, response_data, track_id, error_message, raw_response, signed_xml)
@@ -33,6 +35,7 @@ class EcfApiProviderExtension(models.Model):
             rnc=move.company_id.vat,
             encf=move.encf,
             origin=origin,
+            validate_only=validate_only,
         )
 
         # Buscar el log recién creado y asignar el move_id

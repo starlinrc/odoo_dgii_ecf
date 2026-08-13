@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import re
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
 
@@ -574,6 +576,18 @@ class AccountMove(models.Model):
                 }
             }
 
+    def get_qr_dgii_url(self):
+        """
+        Retorna la URL real de validación DGII (dgii_qr_url, recibida en la
+        respuesta de MSeller/DGII) codificada para usarse en /report/barcode/QR/.
+        No se debe fabricar una URL propia: DGII exige la URL exacta que
+        ellos generan al firmar el e-CF (incluye FechaFirma y CodigoSeguridad).
+        """
+        self.ensure_one()
+        if not self.dgii_qr_url:
+            return ''
+        return quote(self.dgii_qr_url, safe='')
+
     def action_preview_dgii_json(self):
         """
         Muestra el JSON que se enviaría a DGII sin enviarlo.
@@ -661,12 +675,21 @@ class AccountMove(models.Model):
         # Procesar respuesta exitosa
         data = response_data.get('data', response_data) if isinstance(response_data, dict) else {}
 
+        # El QR y el código de seguridad suelen quedar disponibles recién
+        # cuando DGII/MSeller termina de firmar (a veces no vienen en el
+        # envío inicial, sino al consultar estado más tarde).
+        qr_url = data.get('qr_url') or data.get('qrCodeUrl') or data.get('qrUrl')
+        security_code = (
+            data.get('securityCode') or data.get('security_code')
+            or data.get('codigoSeguridad') or data.get('ecfSecurityCode')
+        )
+
         self.write({
             'dgii_track_id': track_id or data.get('trackId'),
             'dgii_estado': 'pending' if data.get('codigo') in ('0', 0, None) else 'accepted',
-            'dgii_signed_xml': signed_xml or data.get('signedXml') or data.get('signedEcfXml'),
-            'dgii_security_code': data.get('securityCode') or data.get('ecfSecurityCode'),
-            'dgii_qr_url': data.get('qrCodeUrl'),
+            'dgii_signed_xml': signed_xml or data.get('signedXml') or data.get('signedEcfXml') or self.dgii_signed_xml,
+            'dgii_security_code': security_code or self.dgii_security_code,
+            'dgii_qr_url': qr_url or self.dgii_qr_url,
             'dgii_last_status_date': fields.Datetime.now(),
             'dgii_response_message': self._format_dgii_messages(data),
             'dgii_response_raw': json.dumps(response_data, ensure_ascii=False) if isinstance(response_data, dict) else raw_response,
@@ -684,6 +707,71 @@ class AccountMove(models.Model):
             'params': {
                 'title': _('Enviado a DGII'),
                 'message': _('TrackID: %s') % (track_id or _('N/D')),
+                'type': 'success',
+                'sticky': False,
+            }
+        }
+
+    def action_validate_dgii_json_online(self):
+        """
+        Valida el JSON del e-CF contra MSeller (?validate=true) sin consumir
+        la secuencia de e-NCF ni enviar el documento a DGII. Útil para
+        depurar el formato antes de un envío real.
+        """
+        self.ensure_one()
+
+        self._validate_before_dgii_send()
+
+        provider = self.env['ecf.api.provider'].get_default_provider()
+        if not provider:
+            raise UserError(_(
+                'No hay proveedor de API configurado.\n\n'
+                'Configure un proveedor en:\nDGII → Técnico → Proveedores de API'
+            ))
+
+        if provider.provider_type != 'mseller':
+            raise UserError(_(
+                'La validación sin envío solo está soportada con el proveedor MSeller.\n'
+                'Proveedor actual: %s'
+            ) % provider.name)
+
+        invoice_data = self._build_dgii_invoice_data()
+
+        move_type = self.move_type
+        if move_type in ('out_refund', 'in_refund'):
+            origin = 'credit_note'
+        elif self.encf and self.encf[1:3] == '33':
+            origin = 'debit_note'
+        else:
+            origin = 'invoice'
+
+        success, response_data, track_id, error_msg, raw_response, signed_xml = provider.send_ecf_from_invoice(
+            ecf_json=invoice_data,
+            move=self,
+            origin=origin,
+            validate_only=True,
+        )
+
+        # No se escriben campos de estado del e-CF: esto es solo una
+        # validación de formato, no un envío real.
+        data = response_data.get('data', response_data) if isinstance(response_data, dict) else {}
+        mensaje = self._format_dgii_messages(data) if isinstance(data, dict) else ''
+        self.write({
+            'dgii_response_message': _('[VALIDACIÓN, no enviado a DGII] %s') % (mensaje or error_msg or ''),
+            'dgii_response_raw': json.dumps(response_data, ensure_ascii=False) if isinstance(response_data, dict) else raw_response,
+        })
+
+        if not success:
+            raise UserError(_(
+                'Validación fallida (formato inválido):\n%s'
+            ) % (error_msg or 'Error desconocido'))
+
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _('Formato Válido'),
+                'message': _('El JSON pasó la validación de MSeller. No se consumió la secuencia ni se envió a DGII.'),
                 'type': 'success',
                 'sticky': False,
             }
@@ -879,6 +967,22 @@ class AccountMove(models.Model):
 
         return result
 
+    @staticmethod
+    def _sanitize_dgii_phone(phone):
+        """
+        Normaliza un teléfono al formato exigido por DGII: exactamente
+        10 dígitos, sin espacios, guiones, paréntesis ni código de país.
+        Devuelve None si no se puede obtener un número de 10 dígitos válido.
+        """
+        if not phone:
+            return None
+        digits = re.sub(r'\D', '', phone)
+        if len(digits) == 11 and digits.startswith('1'):
+            digits = digits[1:]
+        if len(digits) == 10:
+            return digits
+        return None
+
     def _build_ecf_emisor(self, include_optional=True):
         """Construye la sección Emisor del ECF."""
         company = self.company_id
@@ -886,7 +990,6 @@ class AccountMove(models.Model):
             "RNCEmisor": company.vat or '',
             "RazonSocialEmisor": company.name or '',
             "DireccionEmisor": company.street or '',
-            "FechaEmision": (self.invoice_date or fields.Date.context_today(self)).strftime("%d-%m-%Y"),
         }
 
         if include_optional:
@@ -896,12 +999,16 @@ class AccountMove(models.Model):
                 emisor["Municipio"] = company.partner_id.x_dgii_municipio
             if hasattr(company.partner_id, 'x_dgii_provincia') and company.partner_id.x_dgii_provincia:
                 emisor["Provincia"] = company.partner_id.x_dgii_provincia
-            if company.phone:
-                emisor["TablaTelefonoEmisor"] = {"TelefonoEmisor": [company.phone]}
+            telefono = self._sanitize_dgii_phone(company.phone)
+            if telefono:
+                emisor["TablaTelefonoEmisor"] = {"TelefonoEmisor": [telefono]}
             if company.email:
                 emisor["CorreoEmisor"] = company.email
             if company.website:
                 emisor["WebSite"] = company.website
+
+        # FechaEmision debe ser el último campo de Emisor según el XSD de DGII.
+        emisor["FechaEmision"] = (self.invoice_date or fields.Date.context_today(self)).strftime("%d-%m-%Y")
 
         return emisor
 
@@ -914,14 +1021,14 @@ class AccountMove(models.Model):
         }
 
         if include_optional:
+            if partner.email:
+                comprador["CorreoComprador"] = partner.email
             if partner.street:
                 comprador["DireccionComprador"] = partner.street
             if hasattr(partner, 'x_dgii_municipio') and partner.x_dgii_municipio:
                 comprador["MunicipioComprador"] = partner.x_dgii_municipio
             if hasattr(partner, 'x_dgii_provincia') and partner.x_dgii_provincia:
                 comprador["ProvinciaComprador"] = partner.x_dgii_provincia
-            if partner.email:
-                comprador["CorreoComprador"] = partner.email
 
         return comprador
 
@@ -965,17 +1072,19 @@ class AccountMove(models.Model):
                 "IndicadorFacturacion": self._get_indicador_facturacion(line),
                 "NombreItem": (line.name or line.product_id.name or 'Producto')[:80],
                 "IndicadorBienoServicio": int(bien_servicio),
-                "CantidadItem": f"{line.quantity:.2f}",
-                "UnidadMedida": unidad_medida,
-                "PrecioUnitarioItem": f"{line.price_unit:.4f}",
-                "MontoItem": f"{line.price_subtotal:.2f}",
             }
 
-            # Agregar descripción si es diferente al nombre
+            # DescripcionItem debe ir aquí (entre IndicadorBienoServicio y
+            # CantidadItem) según el XSD de DGII, no al final del Item.
             if line.name and line.product_id and line.name != line.product_id.name:
                 descripcion = line.name[:250] if len(line.name) > 250 else line.name
                 if descripcion != item["NombreItem"]:
                     item["DescripcionItem"] = descripcion
+
+            item["CantidadItem"] = f"{line.quantity:.2f}"
+            item["UnidadMedida"] = unidad_medida
+            item["PrecioUnitarioItem"] = f"{line.price_unit:.4f}"
+            item["MontoItem"] = f"{line.price_subtotal:.2f}"
 
             items.append(item)
 
@@ -996,30 +1105,43 @@ class AccountMove(models.Model):
             itbis_data['itbis_0']
         )
 
-        # Montos gravados por tasa
+        # Orden requerido por el XSD de DGII: MontoGravadoTotal, MontoGravadoI1/2/3,
+        # MontoExento, ITBIS1/2/3, TotalITBIS, TotalITBIS1/2/3, MontoTotal.
         if monto_gravado_total > 0:
             totales["MontoGravadoTotal"] = f"{monto_gravado_total:.2f}"
 
         if itbis_data['monto_gravado_18'] > 0:
             totales["MontoGravadoI1"] = f"{itbis_data['monto_gravado_18']:.2f}"
-            totales["ITBIS1"] = "18"
-            totales["TotalITBIS1"] = f"{itbis_data['itbis_18']:.2f}"
 
         if itbis_data['monto_gravado_16'] > 0:
             totales["MontoGravadoI2"] = f"{itbis_data['monto_gravado_16']:.2f}"
-            totales["ITBIS2"] = "16"
-            totales["TotalITBIS2"] = f"{itbis_data['itbis_16']:.2f}"
 
         if itbis_data['monto_gravado_0'] > 0:
             totales["MontoGravadoI3"] = f"{itbis_data['monto_gravado_0']:.2f}"
-            totales["ITBIS3"] = "0"
-            totales["TotalITBIS3"] = f"{itbis_data['itbis_0']:.2f}"
 
         if itbis_data['monto_exento'] > 0:
             totales["MontoExento"] = f"{itbis_data['monto_exento']:.2f}"
 
+        if itbis_data['monto_gravado_18'] > 0:
+            totales["ITBIS1"] = "18"
+
+        if itbis_data['monto_gravado_16'] > 0:
+            totales["ITBIS2"] = "16"
+
+        if itbis_data['monto_gravado_0'] > 0:
+            totales["ITBIS3"] = "0"
+
         if total_itbis > 0:
             totales["TotalITBIS"] = f"{total_itbis:.2f}"
+
+        if itbis_data['monto_gravado_18'] > 0:
+            totales["TotalITBIS1"] = f"{itbis_data['itbis_18']:.2f}"
+
+        if itbis_data['monto_gravado_16'] > 0:
+            totales["TotalITBIS2"] = f"{itbis_data['itbis_16']:.2f}"
+
+        if itbis_data['monto_gravado_0'] > 0:
+            totales["TotalITBIS3"] = f"{itbis_data['itbis_0']:.2f}"
 
         totales["MontoTotal"] = f"{self.amount_total:.2f}"
 
@@ -1047,19 +1169,34 @@ class AccountMove(models.Model):
 
     # ========== BUILDERS POR TIPO DE ECF ==========
 
+    def _get_fecha_limite_pago(self):
+        """
+        Fecha límite de pago para IdDoc. DGII exige este campo cuando
+        TipoPago = '2' (Crédito); no debe enviarse en los demás casos.
+        """
+        if self.x_tipo_pago == '2' and self.invoice_date_due:
+            return self.invoice_date_due.strftime("%d-%m-%Y")
+        return None
+
     def _build_ecf_tipo_31(self):
         """Construye ECF Tipo 31 - Factura de Crédito Fiscal."""
         itbis_data = self._calculate_itbis_by_rate()
 
+        id_doc = {
+            "TipoeCF": "31",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "IndicadorMontoGravado": "0",
+            "TipoIngresos": self.x_tipo_ingresos or "01",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "31",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "TipoIngresos": self.x_tipo_ingresos or "01",
-                "TipoPago": self.x_tipo_pago or "1",
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(),
             "Comprador": self._build_ecf_comprador(),
             "Totales": self._build_ecf_totales(itbis_data),
@@ -1093,6 +1230,9 @@ class AccountMove(models.Model):
             "TipoIngresos": self.x_tipo_ingresos or "01",
             "TipoPago": self.x_tipo_pago or "1",
         }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
 
         # Construir TablaFormasPago dinámicamente
         id_doc["TablaFormasPago"] = self._build_tabla_formas_pago()
@@ -1170,15 +1310,20 @@ class AccountMove(models.Model):
         """Construye ECF Tipo 33 - Nota de Débito."""
         itbis_data = self._calculate_itbis_by_rate()
 
+        id_doc = {
+            "TipoeCF": "33",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "TipoIngresos": self.x_tipo_ingresos or "01",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "33",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "TipoIngresos": self.x_tipo_ingresos or "01",
-                "TipoPago": self.x_tipo_pago or "1",
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(),
             "Comprador": self._build_ecf_comprador(),
             "Totales": self._build_ecf_totales(itbis_data),
@@ -1212,6 +1357,9 @@ class AccountMove(models.Model):
             "TipoIngresos": self.x_tipo_ingresos or "01",
             "TipoPago": self.x_tipo_pago or "1",
         }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
         # NOTA: Según normativa DGII, la secuencia de NC tipo 34 NO lleva
         # FechaVencimientoSecuencia (código 0 = "No corresponde")
         # Por lo tanto, NO se incluye este campo para tipo 34
@@ -1246,21 +1394,26 @@ class AccountMove(models.Model):
         totales["TotalISRRetencion"] = "0.00"
         totales["ValorPagar"] = f"{self.amount_total:.2f}"
 
+        id_doc = {
+            "TipoeCF": "41",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "IndicadorMontoGravado": "0",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+        id_doc["TablaFormasPago"] = {
+            "FormaDePago": [{
+                "FormaPago": 1,
+                "MontoPago": f"{self.amount_total:.2f}"
+            }]
+        }
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "41",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "IndicadorMontoGravado": "0",
-                "TipoPago": self.x_tipo_pago or "1",
-                "TablaFormasPago": {
-                    "FormaDePago": [{
-                        "FormaPago": 1,
-                        "MontoPago": f"{self.amount_total:.2f}"
-                    }]
-                }
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(include_optional=False),
             "Comprador": self._build_ecf_comprador(),
             "Totales": totales,
@@ -1311,21 +1464,26 @@ class AccountMove(models.Model):
             "ValorPagar": f"{self.amount_total:.2f}",
         }
 
+        id_doc = {
+            "TipoeCF": "44",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "TipoIngresos": self.x_tipo_ingresos or "01",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+        id_doc["TablaFormasPago"] = {
+            "FormaDePago": [{
+                "FormaPago": 1,
+                "MontoPago": f"{self.amount_total:.2f}"
+            }]
+        }
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "44",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "TipoIngresos": self.x_tipo_ingresos or "01",
-                "TipoPago": self.x_tipo_pago or "1",
-                "TablaFormasPago": {
-                    "FormaDePago": [{
-                        "FormaPago": 1,
-                        "MontoPago": f"{self.amount_total:.2f}"
-                    }]
-                }
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(),
             "Comprador": self._build_ecf_comprador(),
             "Totales": totales,
@@ -1344,16 +1502,21 @@ class AccountMove(models.Model):
         totales = self._build_ecf_totales(itbis_data)
         totales["ValorPagar"] = f"{self.amount_total:.2f}"
 
+        id_doc = {
+            "TipoeCF": "45",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "IndicadorMontoGravado": "0",
+            "TipoIngresos": self.x_tipo_ingresos or "01",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "45",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "IndicadorMontoGravado": "0",
-                "TipoIngresos": self.x_tipo_ingresos or "01",
-                "TipoPago": self.x_tipo_pago or "1",
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(),
             "Comprador": self._build_ecf_comprador(),
             "Totales": totales,
@@ -1380,15 +1543,20 @@ class AccountMove(models.Model):
             "ValorPagar": f"{self.amount_total:.2f}",
         }
 
+        id_doc = {
+            "TipoeCF": "46",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "TipoIngresos": self.x_tipo_ingresos or "01",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "46",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "TipoIngresos": self.x_tipo_ingresos or "01",
-                "TipoPago": self.x_tipo_pago or "1",
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(),
             "Comprador": self._build_ecf_comprador(),
             "Totales": totales,
@@ -1420,20 +1588,25 @@ class AccountMove(models.Model):
             "TotalISRRetencion": "0.00",  # TODO: calcular retención real
         }
 
+        id_doc = {
+            "TipoeCF": "47",
+            "eNCF": self.encf,
+            "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
+            "TipoPago": self.x_tipo_pago or "1",
+        }
+        fecha_limite_pago = self._get_fecha_limite_pago()
+        if fecha_limite_pago:
+            id_doc["FechaLimitePago"] = fecha_limite_pago
+        id_doc["TablaFormasPago"] = {
+            "FormaDePago": [{
+                "FormaPago": 1,
+                "MontoPago": f"{self.amount_total:.2f}"
+            }]
+        }
+
         encabezado = {
             "Version": "1.0",
-            "IdDoc": {
-                "TipoeCF": "47",
-                "eNCF": self.encf,
-                "FechaVencimientoSecuencia": self._get_dgii_range_expiration() or "",
-                "TipoPago": self.x_tipo_pago or "1",
-                "TablaFormasPago": {
-                    "FormaDePago": [{
-                        "FormaPago": 1,
-                        "MontoPago": f"{self.amount_total:.2f}"
-                    }]
-                }
-            },
+            "IdDoc": id_doc,
             "Emisor": self._build_ecf_emisor(),
             "Comprador": self._build_ecf_comprador_extranjero(),
             "Totales": totales,
@@ -1520,17 +1693,50 @@ class AccountMove(models.Model):
             '0': 'pending',
             '1': 'accepted',
             '2': 'rejected',
+            '4': 'accepted',  # Aceptado Condicional (aceptado con observaciones)
             0: 'pending',
             1: 'accepted',
             2: 'rejected',
+            4: 'accepted',
         }
-        new_state = estado_map.get(data.get('codigo'), self.dgii_estado or 'pending')
-        self.write({
+        codigo = data.get('codigo')
+        if codigo is not None:
+            new_state = estado_map.get(codigo, self.dgii_estado or 'pending')
+        else:
+            # Algunos endpoints de consulta devuelven 'status'/'estado' como
+            # texto en vez de 'codigo' numérico.
+            status_text = (data.get('status') or data.get('estado') or '').lower()
+            if 'rechaz' in status_text:
+                new_state = 'rejected'
+            elif 'acept' in status_text:
+                new_state = 'accepted'
+            else:
+                new_state = self.dgii_estado or 'pending'
+
+        # El QR y el código de seguridad solo quedan disponibles una vez que
+        # DGII/MSeller termina de firmar el documento (no vienen en el envío
+        # inicial). Distintos nombres de campo según el endpoint consultado.
+        qr_url = data.get('qr_url') or data.get('qrCodeUrl') or data.get('qrUrl')
+        security_code = (
+            data.get('securityCode') or data.get('security_code')
+            or data.get('codigoSeguridad') or data.get('ecfSecurityCode')
+        )
+        signed_xml = data.get('signedXml') or data.get('signed_xml') or data.get('signedEcfXml')
+
+        vals = {
             'dgii_estado': new_state,
             'dgii_last_status_date': fields.Datetime.now(),
             'dgii_response_message': self._format_dgii_messages(data),
             'dgii_response_raw': json.dumps(result, ensure_ascii=False),
-        })
+        }
+        if qr_url:
+            vals['dgii_qr_url'] = qr_url
+        if security_code:
+            vals['dgii_security_code'] = security_code
+        if signed_xml:
+            vals['dgii_signed_xml'] = signed_xml
+
+        self.write(vals)
 
         note = _('DGII estado actualizado: %s') % data.get('estado', new_state)
         self.message_post(body=note)

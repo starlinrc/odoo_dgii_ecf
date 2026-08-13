@@ -25,6 +25,11 @@
                         invisible="not encf or state != 'posted' or move_type not in ['out_invoice', 'out_refund']"
                         class="btn-success"
                         groups="account.group_account_invoice"/>
+                <button name="action_validate_dgii_json_online" string="Validar sin Enviar" type="object"
+                        invisible="not encf or state != 'posted' or move_type not in ['out_invoice', 'out_refund']"
+                        class="btn-secondary"
+                        groups="account.group_account_invoice"
+                        title="Valida el formato del e-CF contra MSeller (?validate=true) sin consumir la secuencia de e-NCF ni enviar a DGII"/>
                 <button name="action_check_dgii_status" string="Consultar Estado DGII" type="object"
                         invisible="not dgii_track_id"
                         class="btn-secondary"
