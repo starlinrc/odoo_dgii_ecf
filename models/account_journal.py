@@ -151,9 +151,7 @@ class AccountJournal(models.Model):
             domain.append(('fecha_vencimiento', '>=', fields.Date.today()))
         else:
             # Para tipo 34, aceptar rangos sin fecha o con fecha válida
-            domain.insert(0, '|')
-            domain.append(('fecha_vencimiento', '=', False))
-            domain.append(('fecha_vencimiento', '>=', fields.Date.today()))
+            domain += ['|', ('fecha_vencimiento', '=', False), ('fecha_vencimiento', '>=', fields.Date.today())]
 
         ranges = self.env['dgii.ecf.sequence.range'].search(domain, order='secuencia_actual asc')
 

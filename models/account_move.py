@@ -970,8 +970,8 @@ class AccountMove(models.Model):
     @staticmethod
     def _sanitize_dgii_phone(phone):
         """
-        Normaliza un teléfono al formato exigido por DGII: exactamente
-        10 dígitos, sin espacios, guiones, paréntesis ni código de país.
+        Normaliza un teléfono al formato exigido por DGII: NNN-NNN-NNNN
+        (10 dígitos con guiones, sin espacios, paréntesis ni código de país).
         Devuelve None si no se puede obtener un número de 10 dígitos válido.
         """
         if not phone:
@@ -980,7 +980,7 @@ class AccountMove(models.Model):
         if len(digits) == 11 and digits.startswith('1'):
             digits = digits[1:]
         if len(digits) == 10:
-            return digits
+            return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
         return None
 
     def _build_ecf_emisor(self, include_optional=True):
@@ -1354,6 +1354,7 @@ class AccountMove(models.Model):
             "TipoeCF": "34",
             "eNCF": self.encf,
             "IndicadorNotaCredito": indicador_nc,
+            "IndicadorMontoGravado": "0",
             "TipoIngresos": self.x_tipo_ingresos or "01",
             "TipoPago": self.x_tipo_pago or "1",
         }
