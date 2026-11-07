@@ -919,7 +919,13 @@ class AccountMove(models.Model):
         2 = Gravado ITBIS 16%
         3 = Gravado ITBIS 0%
         4 = Exento de ITBIS
+
+        El tipo 44 (Régimen Especial) solo admite 4 (Exento) o
+        0 (No facturable): DGII lo rechaza con el código 244 en otro caso.
         """
+        if self.encf and self.encf[1:3] == '44':
+            return 4
+
         for tax in line.tax_ids:
             if tax.amount == 18:
                 return 1
